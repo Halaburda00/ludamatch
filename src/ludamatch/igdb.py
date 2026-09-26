@@ -17,9 +17,10 @@ from ludamatch.types import ExternalId, Layer, Match, Store
 # enum, is gone from `external_games` rows.
 SOURCE_IDS: Final = {Store.STEAM: 1, Store.GOG: 5, Store.EPIC: 26}
 
-# IGDB's ceiling on rows per query. One row per uid is the usual answer, so a
-# batch this size can come back truncated only when uids are shared — and a
-# shared uid is refused anyway.
+# IGDB's ceiling on rows per query, and the number of uids asked about at once.
+# A batch can need more rows than that — a uid two games claim has two — and
+# IGDB cuts the rest without saying so. Dropping the second claim would turn an
+# ambiguous uid into a match, so a full page is always followed by the next.
 BATCH_SIZE: Final = 500
 
 # Steam and GOG ids are digits, Epic's are 32 hex characters. Anything else is
@@ -55,7 +56,14 @@ async def match_by_external_id(
     for store, uids in by_store.items():
         for start in range(0, len(uids), BATCH_SIZE):
             batch = uids[start : start + BATCH_SIZE]
-            rows = await client.query("external_games", external_games_query(store, batch))
+            rows: list[dict[str, Any]] = []
+            while True:
+                page = await client.query(
+                    "external_games", external_games_query(store, batch, offset=len(rows))
+                )
+                rows.extend(page)
+                if len(page) < BATCH_SIZE:
+                    break
             found = read_external_games(store, rows)
             # Only what was asked. A row for another uid would be a bug on the
             # other side, and it should not become a match nobody requested.
@@ -68,12 +76,13 @@ async def match_by_external_id(
     return matches
 
 
-def external_games_query(store: Store, uids: Sequence[str]) -> str:
+def external_games_query(store: Store, uids: Sequence[str], *, offset: int = 0) -> str:
     quoted = ",".join(f'"{uid}"' for uid in uids)
+    # Sorted, or an offset walks an order IGDB is free to change between pages.
     return (
         f"fields game,uid; "
         f"where external_game_source = {SOURCE_IDS[store]} & uid = ({quoted}); "
-        f"limit {BATCH_SIZE};"
+        f"sort id asc; limit {BATCH_SIZE}; offset {offset};"
     )
 
 

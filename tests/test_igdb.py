@@ -19,17 +19,34 @@ from ludamatch.igdb import BATCH_SIZE
 
 
 class FakeIgdb:
+    """Answers as IGDB does, `limit` and `offset` included: rows past the limit
+    are cut without a word, in the order of the rows' ids."""
+
     def __init__(self, rows: list[dict[str, Any]]) -> None:
-        self.rows = rows
+        self.rows = [{"id": n, **row} for n, row in enumerate(rows)]
         self.queries: list[tuple[str, str]] = []
 
     async def query(self, endpoint: str, body: str) -> list[dict[str, Any]]:
         self.queries.append((endpoint, body))
-        found = re.search(r"external_game_source = (\d+)", body)
-        assert found is not None
-        source = int(found.group(1))
+        source = int(clause(r"external_game_source = (\d+)", body))
+        limit = int(clause(r"limit (\d+);", body))
+        offset = int(clause(r"offset (\d+);", body, default="0"))
         asked = set(re.findall(r'"([^"]+)"', body))
-        return [r for r in self.rows if r.get("source", source) == source and r.get("uid") in asked]
+        found = [
+            r for r in self.rows if r.get("source", source) == source and r.get("uid") in asked
+        ]
+        return [
+            {key: value for key, value in row.items() if key != "source"}
+            for row in found[offset : offset + limit]
+        ]
+
+
+def clause(pattern: str, body: str, default: str | None = None) -> str:
+    found = re.search(pattern, body)
+    if found is None:
+        assert default is not None, f"no {pattern!r} in {body!r}"
+        return default
+    return found.group(1)
 
 
 def steam(uid: str) -> ExternalId:
@@ -45,7 +62,8 @@ async def test_matches_an_id_to_the_one_game_that_claims_it() -> None:
     assert client.queries == [
         (
             "external_games",
-            'fields game,uid; where external_game_source = 1 & uid = ("100"); limit 500;',
+            'fields game,uid; where external_game_source = 1 & uid = ("100"); '
+            "sort id asc; limit 500; offset 0;",
         )
     ]
 
@@ -101,7 +119,22 @@ async def test_batches_at_the_row_ceiling_and_asks_once_per_uid() -> None:
     matches = await match_by_external_id(client, [steam(uid) for uid in uids + uids])
 
     assert len(matches) == BATCH_SIZE + 1
-    assert [body.count('"') // 2 for _, body in client.queries] == [BATCH_SIZE, 1]
+    # The first batch fills a page exactly, so it is asked once more to be sure.
+    assert [
+        (body.count('"') // 2, clause(r"offset (\d+);", body)) for _, body in client.queries
+    ] == [(BATCH_SIZE, "0"), (BATCH_SIZE, "500"), (1, "0")]
+
+
+async def test_a_full_batch_is_read_to_the_end_before_anything_is_decided() -> None:
+    uids = [str(n) for n in range(BATCH_SIZE)]
+    # The second claim on uid 0 is the last row, past the first page.
+    client = FakeIgdb([{"game": int(uid), "uid": uid} for uid in uids] + [{"game": 99, "uid": "0"}])
+
+    matches = await match_by_external_id(client, [steam(uid) for uid in uids])
+
+    assert steam("0") not in matches
+    assert len(matches) == BATCH_SIZE - 1
+    assert [clause(r"offset (\d+);", body) for _, body in client.queries] == ["0", "500"]
 
 
 async def test_a_row_for_a_uid_nobody_asked_about_is_ignored() -> None:
